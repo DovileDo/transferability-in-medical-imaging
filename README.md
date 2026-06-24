@@ -12,7 +12,7 @@ This PyTorch implementation enables the calculation of transferability scores an
 - Designed specifically for medical imaging datasets.
 
 For access to the models and data used in the paper, please refer to:
-* [MedMNIST datasets and pre-trained models](https://medmnist.com/) (we used ResNet18 224x224),
+* [MedMNIST datasets and pre-trained models](https://medmnist.com/) (models available here: [https://zenodo.org/records/7782114?preview_file=weights_chestmnist.zip](https://zenodo.org/records/7782114) we used resnet18_224_1),
 * [RadImageNet](https://github.com/BMEII-AI/RadImageNet),
 * [Leave-target-out MedMNIST pretraining](https://osf.io/4zgrd/), and
 * [Subsets of MedMNIST datasets used in our paper](https://osf.io/4zgrd/).
