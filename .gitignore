@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+
+# the split manifests (data/splits/*.json) are tracked -- they define the samples.
+# the bundles hold the pixels: build them with src/make_splits.py or copy them in.
+data/splits/bundles/
+
+# cached backbone features, rebuilt by the feature-extraction scripts
+features_model/
+features_model_cpu/
+
+# HPO studies: the SQLite database, the heartbeat and the saved predictions, all written
+# by a running job. Tracking them would have every compute node dirtying its own checkout
+# while it works, and they run to gigabytes across eleven targets. What the paper reads is
+# the collected tables that src/hpo_collect.py writes into results/.
+results/hpo/
+results/hpo_abandoned/
+
+# run logs, and the compiled paper
+*.log
+/paper.pdf
+
+# local editor and agent state
+.claude/

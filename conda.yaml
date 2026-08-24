@@ -4,14 +4,30 @@ dependencies:
     - pip
     - boto3
     - pip:
+      # deep learning + pipeline (pretraining, fine-tuning, transferability scoring)
       - torch
-      - torchsampler
       - torchvision
+      - torchsampler
+      - timm                     # ViT / Swin backbones for the transformer experiments
+      - pytorch-metric-learning  # triplet loss used in src/metrics.py (S_FU)
+      # datasets / image IO
+      - medmnist
+      - opencv-python
+      # numerical, ML, stats (metrics.py, analysis scripts, notebooks)
+      - numpy<2                  # NB: code uses np.Inf, removed in numpy 2.0
+      - pandas<3
+      - scipy
+      - scikit-learn
+      - scikit-posthocs          # Friedman + post-hoc tests in the notebooks
+      - optuna>=3.0              # hyperparameter search in src/hpo_finetune.py
+      # plotting + notebooks
+      - matplotlib
+      - seaborn
+      - jupyterlab
+      - ipykernel
+      # experiment tracking / logging
       - mlflow>=1.0
       - tensorboardX
       - psutil
       - radt
       - migedit
-      - opencv-python
-      - medmnist
-
