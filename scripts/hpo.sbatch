@@ -27,15 +27,23 @@ TARGET="$1"
 [ -n "$TARGET" ] || { echo "usage: sbatch scripts/hpo.sbatch <target>" >&2; exit 2; }
 
 echo "Running on $(hostname): $TARGET"
-module load Anaconda3
-source activate similarity
+export TMPDIR=$HOME/tmp
+
+module load Miniconda3/25.5.1-1
+module load GCCcore/13.3.0
+# the conda shell function is not defined in a batch job; conda activate needs it
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$HOME/envs/similarity" || exit 1
+export PYTHONNOUSERSITE=1
 
 REPO="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$REPO" || exit 1
 
 SHARED="$REPO/results/hpo"
+# /tmp, not $TMPDIR, as the fallback: TMPDIR is set to $HOME/tmp above, and falling back
+# there would put the study back on the shared filesystem, which is what this avoids.
 LOCAL="/scratch/$USER/hpo-$SLURM_JOB_ID"
-mkdir -p "$LOCAL/$TARGET" 2>/dev/null || LOCAL="${TMPDIR:-/tmp}/hpo-$SLURM_JOB_ID"
+mkdir -p "$LOCAL/$TARGET" 2>/dev/null || LOCAL="/tmp/hpo-$SLURM_JOB_ID"
 mkdir -p "$LOCAL/$TARGET" "$SHARED/$TARGET" || exit 1
 echo "working in $LOCAL"
 
