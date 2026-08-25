@@ -29,6 +29,11 @@ TARGET="$1"
 echo "Running on $(hostname): $TARGET"
 export TMPDIR=$HOME/tmp
 
+# The DataLoader keeps several loaders alive with persistent workers, and each shared
+# tensor handed back to the parent costs a descriptor. At the default soft limit of 1024
+# the run dies part-way through a study on 'Too many open files'.
+ulimit -n "$(ulimit -Hn)"
+
 module load Miniconda3/25.5.1-1
 module load GCCcore/13.3.0
 # the conda shell function is not defined in a batch job; conda activate needs it
