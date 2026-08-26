@@ -1593,7 +1593,6 @@ def main(argv=None):
             f'bundles hold only the training folds and the validation split.\n'
             f'Point MEDMNIST_ROOT at the directory holding <target>_224.npz, or drop '
             f'--no-build and it will be fetched.')
-    per_fold_val = 'folds_index' in manifest.get('val', {})
     # what every part this run will touch is supposed to be, from the tracked manifest.
     # The folds of the final stage decide the reported number, so recording only the
     # search fold would leave most of the ground truth traceable to nothing; each is
@@ -1607,18 +1606,12 @@ def main(argv=None):
         return train_cache[fold]
 
     def valsplit(fold):
-        """The validation part of one fold.
-
-        Under the older two-pool draw there is one shared split, so every fold resolves
-        to the same dataset object and the same loader -- the fold argument then only
-        selects which name it is recorded under.
-        """
-        key = fold if per_fold_val else None
-        if key not in val_cache:
-            val_cache[key], entry = load_val(cfg.target, fold, cfg.bundle_dir)
-            part_sha[splits.val_part(cfg.target, fold)] = entry['images_sha256']
-            val_cache[(key, 'entry')] = entry
-        return val_cache[key]
+        """The validation part of one fold."""
+        if fold not in val_cache:
+            val_cache[fold], entry = load_val(cfg.target, fold, cfg.bundle_dir)
+            part_sha[f'val_fold{fold}'] = entry['images_sha256']
+            val_cache[(fold, 'entry')] = entry
+        return val_cache[fold]
 
     def testset():
         if 'ds' not in testset_cache:
@@ -1627,7 +1620,7 @@ def main(argv=None):
 
     trainset = split(cfg.fold)
     valset = valsplit(cfg.fold)
-    val_entry = val_cache[(cfg.fold if per_fold_val else None, 'entry')]
+    val_entry = val_cache[(cfg.fold, 'entry')]
     ctx = {'device': device, 'task': info['task'],
            'n_classes': len(info['label']), 'split': split, 'valsplit': valsplit,
            'testset': testset, 'train_sha': part_sha}
@@ -1651,9 +1644,6 @@ def main(argv=None):
                                  previous.get('train_sha256_by_part', {}))
         checks = [(f'training fold {cfg.fold}', previous.get('train_sha256'),
                    part_sha[f'train_fold{cfg.fold}'])]
-        if not per_fold_val:
-            checks.append(('validation split', previous.get('val_sha256'),
-                           val_entry['images_sha256']))
         # every part this run would touch, not just the one it searches on: a bundle
         # whose fold 3 differs produces a different reported number and nothing else
         # would notice. Validation is in here too now that it is drawn per fold.
@@ -1678,8 +1668,6 @@ def main(argv=None):
             'batch_sizes': cfg.batch_sizes, 'patience': cfg.patience,
             'startup_trials': cfg.startup_trials, 'fold': cfg.fold,
             'bundle': bundle,
-            'split_scheme': splits.scheme_of(manifest),
-            'val_per_fold': per_fold_val,
             'val_sha256': val_entry['images_sha256'],
             'val_class_counts': val_entry['class_counts'],
             'train_sha256': part_sha[f'train_fold{cfg.fold}'],
@@ -1702,13 +1690,12 @@ def main(argv=None):
     print(f'  train fold {cfg.fold} (sha256 '
           f'{part_sha[f"train_fold{cfg.fold}"][:12]}): '
           f'{describe_labels(trainset, cfg.target)}')
-    print(f'  val {"fold " + str(cfg.fold) if per_fold_val else "(shared)"} '
-          f'(<={splits.VAL_PER_CLASS}/class, sha256 '
+    print(f'  val fold {cfg.fold} (n_classes*{splits.VAL_PER_CLASS} budget, sha256 '
           f'{val_entry["images_sha256"][:12]}): '
           f'{describe_labels(valset, cfg.target)}')
-    if per_fold_val:
-        print(f'  validation is drawn per fold from the same collection as that '
-              f"fold's training part; folds {folds_used} each have their own")
+    print(f'  validation is drawn per fold from the official validation split, in '
+          f"proportion to that fold's own training class mix; folds {folds_used} each "
+          f'have their own')
     print(f'device {device}, fp32, {len(cfg.archs)} architectures, '
           f'{cfg.trials} trials + {final_runs} final runs each (search on fold '
           f'{cfg.fold}; top {cfg.final_topk} configurations rerun on folds '

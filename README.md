@@ -79,16 +79,17 @@ Three protocol choices are worth knowing about:
   size 16 and 5 at batch size 128, so epoch-based early stopping and pruning would mean
   very different things across the search space. Each trial is validated a fixed number of
   times over its own budget (`--validations-per-trial`).
-- **Selection is on validation data held out of the fold's own draw.** The paper draws
-  its `n_classes*25` validation subsample from the official validation split, separately
-  from the training subsample and uniformly at random, so the two are samples of
-  different things and a rare class can end up with more validation images than training
-  images — `dermamnist` fold 1 has 3 training images of its rarest class against 12
-  validation ones, and folds 2 and 3 have classes with zero and one validation image.
-  A macro AUC is then undefined or extremely noisy for exactly the classes that
-  discriminate between configurations. Each fold here is instead one draw cut in two, so
-  train and val are one collection split, and validation varies per fold rather than
-  sitting on every fold as the same offset.
+- **Training and validation come from the official split each belongs to.** Training is
+  `n_classes*100` images drawn uniformly from the official training split, with nothing
+  removed from it afterwards, so it carries the target's class imbalance exactly as drawn.
+  Validation is `n_classes*25` images from the official validation split, drawn
+  *conditional on the training draw*: its places are handed out in proportion to that
+  draw's class mix, so a class that is rare in training is rare in validation too. That
+  is what keeps validation measuring what the test split measures. A class the proportion
+  leaves with fewer than 3 images takes half of its training count instead — self-limiting,
+  so no class is ever handed more validation images than training ones. Both parts are
+  redrawn per fold, so validation sampling error averages down over the folds instead of
+  sitting on all of them as the same offset.
 
 The ranges are wide on purpose. Selection has to resolve differences of well under a
 percentage point of AUC between architectures, so the space has to contain the optimum
@@ -108,38 +109,52 @@ holding the images themselves. `src/hpo_finetune.py` never draws anything, never
 MedMNIST for its training or validation data, and refuses to start if the bundle it needs
 is not there.
 
-Each of the 5 folds is **one draw, cut in two**: `n_classes*125` images taken uniformly at
-random from the official training split, out of which validation takes up to 25 images of
-each class and never more than half of what that class holds in the draw.
+Each of the 5 folds draws **both parts from the official split each belongs to**:
+`n_classes*100` training images taken uniformly at random from the official training
+split, and `n_classes*25` validation images from the official validation split.
 
 | | drawn |
 |---|---|
-| `train` | what is left of the draw once validation is taken — about `n_classes*100`, unstratified |
-| `val` | ≤25 per class, capped at half that class's members in the draw; a different fold is a different validation set |
+| `train` | `n_classes*100`, uniform from the official train split, unstratified — nothing is removed from it for validation |
+| `val` | `n_classes*25` from the official val split, allocated in proportion to the train draw's class mix, with any class left under 3 images taking half its training count; a different fold is a different validation set |
 
 The training part is deliberately *not* stratified: the natural class imbalance is part of
-the task being studied. The cap on validation is the part that matters. It is what makes a
-fold one collection split in two rather than two samples of different things, and it
-guarantees no class holds more validation images than training images. `dermamnist` fold 1
-is the case that motivated it — its two rarest classes now hold 5 training and 5
-validation images each, where the paper's procedure gives one of them 3 training images
-against 12 validation ones. A class left with a single image keeps it for training; its
-one-vs-rest AUC is then undefined and `auc_per_class` drops it from the macro average,
-which is the honest outcome, because at that point the collection cannot measure it.
+the task being studied, and because validation comes from the other pool the training set
+keeps that imbalance untouched. The validation allocation follows the training draw so that it
+estimates the same quantity the test split does — a macro one-vs-rest AUC is invariant to
+each positive class's prevalence but not to the mixture of negatives that class is ranked
+against. It is drawn conditional on the training draw for exactly that reason: what a
+class is owed in validation is set by how much of it was drawn to train on, not by how
+much of it the official validation split happens to hold.
 
-Folds are drawn from independently spawned PCG64 streams keyed on `(seed 24, target,
-fold)`, so a fold's indices depend only on its own number: rebuilding one, or adding a
-sixth, cannot perturb the others.
+There is no flat floor. A class the proportion leaves with fewer than 3 validation images
+instead takes **half of its training count**, and the largest classes pay for it. Below 3
+positives a one-vs-rest AUC is not an estimate of anything, and that class still enters
+the macro average with the same weight as every other; a standard error near 0.21 at 1
+positive and 0.15 at 2 falls to 0.12 at 3. Taking half of the training count rather than a
+fixed number is what makes the rule self-limiting — a class holding 7 training images gets
+3, one holding 5 gets 2, and no class is ever handed more validation images than it has
+training ones, which is exactly what a flat floor of 10 did to a class holding 7.
 
-`--scheme legacy` builds the paper's procedure instead — `n_classes*100` per fold from the
-official training split and `n_classes*25` from the official validation split, as a replay
-of `src/data_split.py` (legacy `RandomState`, seed 24). That replay reproduces the
-published `dermamnist` subsets exactly, all five folds byte for byte, checked against
-`dermamnist_fine-tune_224.npz`. It does not reproduce the other targets': those files were
-written from a different state of the global RNG, and no ordering of the draws in that
-script recovers them. **The transferability scores in `results/` were computed on
-`train_imgs_fold1` of the OSF subsets**, so under either scheme the scores and a ground
-truth rebuilt here no longer share their training images for those targets.
+The rule fires on `dermamnist` and nowhere else: every other target's smallest validation
+class already sits at 5 or more. On `dermamnist` it costs about 1.5pp of agreement between
+the training and validation class mixes and buys 7–17% off the fold's macro-AUC standard
+error. Where the official validation split is smaller than the budget it is used whole —
+`retinamnist` has 120 validation images against a budget of 125. A class the training draw
+misses entirely gets no validation images, and a class whose AUC is undefined is dropped
+from the macro average by `auc_per_class` rather than propagated.
+
+Folds are drawn from independently spawned PCG64 streams keyed on `(seed 24, fold)`, so a
+fold's indices depend only on its own number: rebuilding one, or adding a sixth, cannot
+perturb the others.
+
+**The transferability scores in `results/` were computed on `train_imgs_fold1` of the
+published OSF subsets.** Those subsets came out of `src/data_split.py`, which drew
+`n_classes*100` training images per fold from a legacy global `RandomState` seeded with
+24. Only the `dermamnist` folds can be reproduced from it byte for byte; the other targets'
+files were written from a different state of that RNG, and no ordering of the draws in the
+script recovers them. So for ten of the eleven targets, those scores and a ground truth
+rebuilt here do not share their training images.
 
 ##### Building them (once, before fine-tuning)
 
@@ -179,8 +194,8 @@ run will need, hashes each part as it loads it against the manifest inside the b
 records them in `meta.json`:
 
 ```
-  train fold 1 (sha256 f941106cecad): 700 images, per-class [28, 34, 75, 3, 81, 468, 11]
-  val (25/class, sha256 879176810e77): 151 images, per-class [25, 25, 25, 12, 25, 25, 14]
+  train fold 1 (sha256 9eea4236ead6): 700 images, per-class [26, 34, 85, 7, 76, 463, 9]
+  val fold 1 (n_classes*25 budget, sha256 62125738f67f): 175 images, per-class [7, 8, 21, 3, 19, 113, 4]
 ```
 
 It refuses to resume a study whose trials were trained or selected on different images.

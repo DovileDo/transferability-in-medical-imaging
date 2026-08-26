@@ -15,15 +15,14 @@ sample than the repository describes is refused rather than used.
 A bundle is a plain compressed npz and can be read without this module:
 
     d = np.load('dermamnist_splits_224.npz')
-    d['train_fold1_images'], d['train_fold1_labels']    # (758, 224, 224, 3), (758, 1)
-    d['val_fold1_images'], d['val_fold1_labels']        # (117, 224, 224, 3), (117, 1)
+    d['train_fold1_images'], d['train_fold1_labels']    # (700, 224, 224, 3), (700, 1)
+    d['val_fold1_images'], d['val_fold1_labels']        # (175, 224, 224, 3), (175, 1)
     d['train_fold1_index']                              # rows of the official train split
     json.loads(str(d['manifest']))                      # checksums, counts, provenance
 
-Both parts of a fold index into the official *training* split: they are one draw, cut in
-two. Bundles built before that change hold a single flat 'val' part taken from the
-official validation split; they still load, and `parts_of` reports which layout a
-manifest is in.
+A fold is two draws from two pools: the training part indexes into the official
+*training* split, the validation part into the official *validation* split. Both are
+redrawn per fold, so every fold has its own `train_fold<k>` and `val_fold<k>`.
 """
 
 import hashlib
@@ -39,16 +38,20 @@ TARGETS = ['bloodmnist', 'breastmnist', 'dermamnist', 'octmnist', 'organamnist',
            'organcmnist', 'organsmnist', 'pathmnist', 'pneumoniamnist', 'retinamnist',
            'tissuemnist']
 
-#: images drawn per fold, before the draw is split into training and validation. At
-#: TOTAL_PER_CLASS 125 and a VAL_PER_CLASS of 25 the split lands near the historical
-#: 100/class train and 25/class validation budgets, so the sizes stay recognisable.
-TOTAL_PER_CLASS = 125
-VAL_PER_CLASS = 25             # per-class validation budget, spent inside the draw
-#: a class never gives more than this share of its images in the draw to validation.
-#: It is what keeps the sample one a real collection could produce: without it a rare
-#: class can end up with more validation images than training images.
-VAL_CAP_FRACTION = 0.5
-SCHEME = 'capped'              # the draw `make_splits.py` performs by default
+#: training images per class, drawn uniformly from the official training split, so the
+#: training set carries the target's own class imbalance exactly as drawn.
+TRAIN_PER_CLASS = 100
+#: validation images per class of budget: `n_classes*25` drawn from the official
+#: validation split, allocated in proportion to the training draw's own class mix.
+VAL_PER_CLASS = 25
+#: a class the proportional allocation leaves with fewer than this many validation
+#: images takes VAL_SPARSE_SHARE of its training count instead: under three positives a
+#: one-vs-rest AUC is not an estimate of anything.
+VAL_SPARSE = 3
+#: what such a class takes instead, as a share of what it holds in training. Half is
+#: self-limiting -- it can never hand a class more validation images than training ones,
+#: which is what a flat floor of three would do to a class holding four.
+VAL_SPARSE_SHARE = 0.5
 FOLDS = 5
 BUNDLE_SUFFIX = '_splits_224.npz'
 
@@ -72,42 +75,10 @@ def manifest_path(target_flag, split_dir=None):
     return os.path.join(split_dir or default_dir(), f'{target_flag}.json')
 
 
-def all_parts(folds=None):
-    """Every part of a bundle: a training and a validation part for each fold."""
-    folds = range(1, FOLDS + 1) if folds is None else folds
-    return ([f'train_fold{f}' for f in folds] + [f'val_fold{f}' for f in folds])
-
-
 def parts_of(man, folds=None):
-    """The parts one manifest actually describes.
-
-    Bundles drawn before validation became per-fold hold a single flat 'val' part; this
-    reports whichever layout the manifest is in, so a caller can check or cut a bundle
-    without knowing which draw produced it.
-    """
+    """Every part one manifest describes: a training and a validation part per fold."""
     folds = sorted(int(f) for f in man['train']['folds_index']) if folds is None else folds
-    train = [f'train_fold{f}' for f in folds]
-    if 'folds_index' in man.get('val', {}):
-        return train + [f'val_fold{f}' for f in folds]
-    return train + ['val']
-
-
-def scheme_of(man):
-    """Which draw produced a manifest, including ones written before the field existed.
-
-    'capped' is one natural-prevalence draw per fold, cut into a training and a
-    validation part; 'legacy' is the older two-pool draw with one shared validation
-    split taken from the official validation set.
-    """
-    return man.get('draw', {}).get('scheme',
-                                   'capped' if 'folds_index' in man.get('val', {})
-                                   else 'legacy')
-
-
-def part_name(fold=None, kind='train'):
-    if kind == 'val':
-        return 'val' if fold is None else f'val_fold{fold}'
-    return 'val' if fold is None else f'train_fold{fold}'
+    return [f'train_fold{f}' for f in folds] + [f'val_fold{f}' for f in folds]
 
 
 def sha256(*arrays):
@@ -136,30 +107,16 @@ def read_manifest(target_flag, split_dir=None):
 
 
 def entry_of(man, part):
-    """The manifest section for one part.
-
-    Accepts both layouts: 'train_fold<k>' and 'val_fold<k>' for a draw that was split
-    per fold, and a flat 'val' for the older bundles whose validation split came from
-    the official validation set and was shared by every fold.
-    """
-    if part == 'val':
-        if 'folds_index' in man.get('val', {}):
-            raise KeyError("this manifest has a validation part per fold; ask for "
-                           "'val_fold<k>' rather than 'val'")
-        return man['val']
+    """The manifest section for one part, 'train_fold<k>' or 'val_fold<k>'."""
     for kind in ('train', 'val'):
         prefix = f'{kind}_fold'
         if part.startswith(prefix):
             fold = part[len(prefix):]
-            section = man[kind]
-            if 'folds_index' not in section:
-                raise KeyError(f'{part}: this manifest has a single shared validation '
-                               f'split, not one per fold')
             try:
-                return section['folds_index'][fold]
+                return man[kind]['folds_index'][fold]
             except KeyError:
                 raise KeyError(f'{part}: fold {fold} is not in the manifest '
-                               f'(it has {sorted(section["folds_index"])})') from None
+                               f'(it has {sorted(man[kind]["folds_index"])})') from None
     raise KeyError(f'unknown part {part!r}')
 
 
@@ -203,7 +160,7 @@ def check_bundle(target_flag, parts=None, dest=None, split_dir=None):
 
 
 def load_part(target_flag, part, dest=None, split_dir=None, verbose=True):
-    """`(images, labels, entry)` for 'val' or 'train_fold<k>', read out of the bundle.
+    """`(images, labels, entry)` for one part, read out of the bundle.
 
     The images are hashed and compared with the manifest inside the bundle, and with the
     git-tracked manifest when there is one, so neither a damaged archive nor a bundle
@@ -241,21 +198,9 @@ def load_part(target_flag, part, dest=None, split_dir=None, verbose=True):
     return images, labels, dict(entry, images_sha256=got)
 
 
-def val_part(target_flag, fold=1, split_dir=None):
-    """'val_fold<k>', or 'val' for a bundle drawn before validation became per-fold."""
-    man = read_manifest(target_flag, split_dir)
-    return f'val_fold{fold}' if 'folds_index' in man.get('val', {}) else 'val'
-
-
 def load_val(target_flag, fold=1, dest=None, split_dir=None, verbose=True):
-    """The validation part of one fold, checksum-verified on load.
-
-    Falls back to the single shared split when the manifest is one of the older ones,
-    so a bundle from either draw can still be read -- what it cannot do is mix them,
-    which the checksum comparison in `load_part` refuses.
-    """
-    return load_part(target_flag, val_part(target_flag, fold, split_dir),
-                     dest, split_dir, verbose)
+    """The validation part of one fold, checksum-verified on load."""
+    return load_part(target_flag, f'val_fold{fold}', dest, split_dir, verbose)
 
 
 def load_train(target_flag, fold=1, dest=None, split_dir=None, verbose=True):

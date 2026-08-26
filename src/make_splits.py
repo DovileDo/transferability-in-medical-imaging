@@ -9,30 +9,27 @@ It needs the official MedMNIST files; `src/hpo_finetune.py` afterwards does not.
   2. cuts those images out of `<target>_224.npz` and writes
      `data/splits/bundles/<target>_splits_224.npz`, plus a `SHA256SUMS` for the lot.
 
-What gets drawn (scheme 'capped', the default):
+What gets drawn:
 
-  Per fold, one draw of `n_classes*125` images taken uniformly at random from the
-  official training split -- not stratified, because the natural class imbalance is part
-  of the task being studied -- and then cut into a training and a validation part. That
-  is the whole point of the scheme: the benchmark simulates having one small dataset, so
-  training and validation have to come out of one collection.
+  Per fold, `n_classes*100` training images taken uniformly at random from the official
+  training split -- not stratified, because the natural class imbalance is part of the
+  task being studied -- and `n_classes*25` validation images taken from the official
+  validation split. Nothing is removed from the training draw to build validation; the
+  two come from the two pools MedMNIST already separates.
 
-  The cut holds out up to 25 images per class, and never more than half of what that
-  class has in the draw. The cap is what keeps the sample realisable: drawing validation
-  from the official validation split instead, as this script used to, gave DermaMNIST
-  fold 2 seven training images of its rarest class and twelve validation images of it --
-  a state no single collection of 875 images could produce. The per-class budget is what
-  keeps a macro AUC estimable: a plain proportional holdout leaves the rarest classes
-  with one or two positives, and their one-vs-rest AUC is then pure noise.
+  Validation is allocated across classes in proportion to the class mix of the fold's
+  own training draw, so it measures the quantity the test split does rather than a
+  reweighted one, and a class that is rare in training is rare in validation too. It is
+  drawn conditional on the training draw for that reason.
 
-  Validation is drawn per fold, so unlike the single shared split this replaces, its
-  sampling error averages down over the folds of the final stage instead of sitting on
-  every fold as the same offset.
+  A class the proportion leaves with fewer than 3 validation images takes half of its
+  training count instead, and the largest classes pay for it. Half is what makes that
+  self-limiting: a class holding 7 training images gets 3, one holding 5 gets 2, and no
+  class is ever handed more validation images than it has training ones -- which is what
+  a flat floor of 10 did, and why there is not one.
 
-  Scheme 'legacy' reproduces the older draw -- `n_classes*100` training images per fold
-  from the official training split and one shared `25`-per-class validation split from
-  the official validation split -- for rebuilding the bundles earlier results were
-  produced against.
+  Both parts are redrawn per fold, so their sampling error averages down over the folds
+  of the final stage instead of sitting on every fold as one common offset.
 
 The bundles are what the benchmark reads and what should be archived (OSF): an index
 reproduces a sample only for as long as the file it indexes into stays available and
@@ -60,15 +57,14 @@ import numpy as np
 from medmnist import INFO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from splits import (BUNDLE_SUFFIX, FOLDS, SCHEME, TARGETS,  # noqa: E402
-                    TOTAL_PER_CLASS, VAL_CAP_FRACTION, VAL_PER_CLASS, bundle_dir,
+from splits import (BUNDLE_SUFFIX, FOLDS, TARGETS, TRAIN_PER_CLASS,  # noqa: E402
+                    VAL_PER_CLASS, VAL_SPARSE, VAL_SPARSE_SHARE, bundle_dir,
                     bundle_path, class_counts, entry_of, manifest_path, parts_of,
-                    read_manifest, scheme_of, sha256)
+                    read_manifest, sha256)
 
 MEDMNIST_ROOT = os.environ.get('MEDMNIST_ROOT', os.path.expanduser('~/.medmnist'))
 
-TRAIN_PER_CLASS = 100          # scheme 'legacy' only: n_classes*100 training images
-SEED = 24                      # the seed src/data_split.py used, kept for both schemes
+SEED = 24                      # the seed src/data_split.py used, kept unchanged
 
 
 def source_path(target_flag):
@@ -232,106 +228,107 @@ def _labels(target_flag, split):
 # drawing
 # --------------------------------------------------------------------------------------
 
-def draw_train(target_flag):
-    """Per-fold training indices: exactly what src/data_split.py drew.
+def _allocate_val(train_counts, available, total):
+    """How many validation images each class gets, given the training draw.
 
-    That script seeded the legacy global RandomState with 24 and, per fold, drew the
-    training subset and then the validation subsample, so the validation draws are
-    replayed here purely to keep the stream aligned. Legacy RandomState is stream-stable
-    across NumPy versions by policy, and the draws depend only on the split sizes, so
-    this reproduces the published dermamnist folds byte for byte. It does not reproduce
-    the other targets' published subsets -- those were written from a different state of
-    the RNG, and no ordering of the draws in that script recovers them.
+    `total` places handed out in proportion to the class mix of the training draw, by
+    largest remainder, and never more of a class than the official validation split
+    holds of it.
+
+    On top of that, a class the proportion leaves with fewer than `VAL_SPARSE` images
+    takes `VAL_SPARSE_SHARE` of its training count instead, and the largest classes pay
+    for it. Below three positives a one-vs-rest AUC is not an estimate of anything, and
+    that class still enters the macro average with the same weight as every other. Half
+    of the training count is what makes the rescue self-limiting: it cannot hand a class
+    more validation images than it has training ones, which is exactly what a flat floor
+    of ten did to a class holding seven, and it leaves a class with five training images
+    at two rather than pretending otherwise.
+
+    A class the training draw misses entirely still gets no validation images, its AUC is
+    undefined, and `auc_per_class` drops it from the macro average -- the honest outcome,
+    since the draw genuinely cannot measure that class.
     """
-    n_classes = len(INFO[target_flag]['label'])
-    n = INFO[target_flag]['n_samples']
-    k_train, k_val = n_classes * TRAIN_PER_CLASS, n_classes * VAL_PER_CLASS
+    train_counts = np.asarray(train_counts, dtype=np.int64)
+    available = np.asarray(available, dtype=np.int64)
 
-    np.random.seed(SEED)
-    folds = {}
-    for fold in range(1, FOLDS + 1):
-        folds[fold] = np.sort(np.random.choice(n['train'], k_train, replace=False))
-        if n['val'] > k_val:
-            np.random.choice(n['val'], k_val, replace=False)     # stream alignment only
-    return folds
+    total = int(min(total, available.sum()))
+    exact = total * train_counts / max(int(train_counts.sum()), 1)
+    n = np.minimum(np.floor(exact).astype(np.int64), available)
 
+    # hand out what rounding down left, by largest remainder among classes with room
+    frac = exact - np.floor(exact)
+    while int(n.sum()) < total:
+        room = np.where(n < available, frac, -np.inf)
+        if not np.isfinite(room).any():               # every class is at its pool size
+            break
+        c = int(np.argmax(room))
+        n[c] += 1
+        frac[c] -= 1.0                                # the next place goes elsewhere
 
-def draw_val(target_flag):
-    """Validation indices: VAL_PER_CLASS per class, or all of a class that has fewer."""
-    info = INFO[target_flag]
-    n_classes = len(info['label'])
-    labels = _labels(target_flag, 'val')
-    rng = np.random.default_rng(SEED)
-
-    if info['task'] == 'multi-label, binary-class':
-        # no single class per image to stratify on; keep the budget, draw uniformly
-        idx = rng.choice(len(labels), min(len(labels), VAL_PER_CLASS * n_classes),
-                         replace=False)
-    else:
-        y = labels.reshape(-1)
-        idx = np.concatenate([
-            rng.choice(np.flatnonzero(y == c), min(int((y == c).sum()), VAL_PER_CLASS),
-                       replace=False)
-            for c in range(n_classes) if (y == c).any()])
-    return np.sort(idx).astype(np.int64)
+    # lift the classes too sparse to estimate an AUC on, never above half their own
+    # training count, and take the places back from whichever class is largest
+    rescue = np.minimum((train_counts * VAL_SPARSE_SHARE).astype(np.int64), available)
+    n = np.where(n < VAL_SPARSE, np.maximum(n, rescue), n)
+    while int(n.sum()) > total:
+        n[int(np.argmax(n))] -= 1
+    return n
 
 
-def _cut_one_draw(y, n_classes, index, task, rng):
-    """Split one natural-prevalence draw into a training and a validation part.
+def draw_official(target_flag):
+    """Training from the official training split, validation from the official one.
 
-    Validation takes up to VAL_PER_CLASS images of each class and never more than
-    VAL_CAP_FRACTION of what that class holds in the draw. The cap is the part that
-    matters: it is what makes the result a split of one collection rather than two
-    samples of different things, and it guarantees no class ends up with more
-    validation images than training images.
+    Training is `n_classes*TRAIN_PER_CLASS` images drawn uniformly, so it carries the
+    target's class imbalance exactly as the official split has it -- nothing is removed
+    from it to build a validation set, which is the point of taking validation from the
+    other pool.
 
-    A class with a single image in the draw keeps it for training. Its one-vs-rest AUC
-    is then undefined and `auc_per_class` drops it from the macro average -- which is
-    the honest outcome, because at that point the collection genuinely cannot measure
-    that class.
-    """
-    drawn = y[index]
-    train, val = [], []
+    Validation is then drawn *conditional on that training draw*: `n_classes*VAL_PER_CLASS`
+    images from the official validation split, allocated across classes in proportion to
+    the training draw's own class mix, with `_allocate_val` lifting any class the
+    proportion leaves too sparse to estimate an AUC on. That proportion is why the two
+    are not drawn independently -- what a class is owed in validation is set by how much
+    of it was drawn to train on, not by how much of it the official validation split
+    happens to hold.
 
-    if task == 'multi-label, binary-class':
-        # no single class per image to hold out on; keep the budget, draw uniformly
-        n_val = min(int(len(index) * VAL_CAP_FRACTION), VAL_PER_CLASS * n_classes)
-        perm = rng.permutation(len(index))
-        val = index[perm[:n_val]]
-        train = index[perm[n_val:]]
-        return np.sort(train).astype(np.int64), np.sort(val).astype(np.int64)
-
-    for c in range(n_classes):
-        members = np.flatnonzero(drawn == c)
-        if len(members) == 0:
-            continue
-        n_val = min(VAL_PER_CLASS, int(len(members) * VAL_CAP_FRACTION))
-        perm = rng.permutation(members)
-        val.extend(index[perm[:n_val]])
-        train.extend(index[perm[n_val:]])
-    return (np.sort(train).astype(np.int64), np.sort(val).astype(np.int64))
-
-
-def draw_capped(target_flag):
-    """`({fold: train_index}, {fold: val_index})` -- the default scheme.
-
-    Each fold is one draw of `n_classes*TOTAL_PER_CLASS` images taken uniformly from the
-    official training split and then cut in two. Folds are drawn from independently
-    spawned streams rather than one shared sequence, so a fold's indices depend only on
-    the seed, the target and its own number: adding a sixth fold, or rebuilding one,
-    cannot perturb the others.
+    Both are redrawn per fold, so their sampling error averages down over the folds of
+    the final stage instead of resting on all of them as one common offset. Where the
+    official validation split is barely larger than the budget the per-fold draws overlap
+    and that averaging degrades gracefully towards none.
     """
     info = INFO[target_flag]
     n_classes = len(info['label'])
-    y = np.asarray(_labels(target_flag, 'train')).reshape(-1)
-    n_total = min(n_classes * TOTAL_PER_CLASS, len(y))
+    n_train = info['n_samples']['train']
+    labels_val = _labels(target_flag, 'val')
+    y_train = _labels(target_flag, 'train')
+
+    k_train = min(n_classes * TRAIN_PER_CLASS, n_train)
+    k_val = n_classes * VAL_PER_CLASS
 
     train, val = {}, {}
     for fold in range(1, FOLDS + 1):
         rng = np.random.default_rng([SEED, fold])
-        index = rng.choice(len(y), n_total, replace=False)
-        train[fold], val[fold] = _cut_one_draw(y, n_classes, index, info['task'], rng)
+        idx = np.sort(rng.choice(n_train, k_train, replace=False)).astype(np.int64)
+        train[fold] = idx
+        val[fold] = _draw_val_official(labels_val, y_train[idx], n_classes, k_val,
+                                       info['task'], rng)
     return train, val
+
+
+def _draw_val_official(labels, train_labels, n_classes, total, task, rng):
+    """`total` images from the official validation split, given the training draw."""
+    if task == 'multi-label, binary-class':
+        # no single class per image to allocate on; keep the budget, draw uniformly
+        return np.sort(rng.choice(len(labels), min(total, len(labels)),
+                                  replace=False)).astype(np.int64)
+
+    y = np.asarray(labels).reshape(-1)
+    yt = np.asarray(train_labels).reshape(-1)
+    members = [np.flatnonzero(y == c) for c in range(n_classes)]
+    take = _allocate_val([int((yt == c).sum()) for c in range(n_classes)],
+                         [len(m) for m in members], total)
+    idx = np.concatenate([rng.choice(m, t, replace=False)
+                          for m, t in zip(members, take) if t > 0])
+    return np.sort(idx).astype(np.int64)
 
 
 def _part_manifest(target_flag, split, index):
@@ -347,7 +344,7 @@ def _part_manifest(target_flag, split, index):
     }
 
 
-def build_manifest(target_flag, split_dir=None, scheme=SCHEME):
+def build_manifest(target_flag, split_dir=None):
     """Draw the splits for one target and write `<target>.json`."""
     info = INFO[target_flag]
     common = {
@@ -358,38 +355,27 @@ def build_manifest(target_flag, split_dir=None, scheme=SCHEME):
                    'n_samples': info['n_samples']},
     }
 
-    if scheme == 'capped':
-        train, val = draw_capped(target_flag)
-        man = dict(common, draw={
-            'scheme': 'capped',
-            'total_per_class': TOTAL_PER_CLASS,
-            'val_per_class': VAL_PER_CLASS,
-            'val_cap_fraction': VAL_CAP_FRACTION,
-            'folds': FOLDS, 'seed': SEED, 'stratified': False,
-            'source_split': 'train',
-            'procedure': 'src/make_splits.py draw_capped (PCG64, spawned per fold)',
-        })
-        man['train'] = {'folds_index': {str(f): _part_manifest(target_flag, 'train', idx)
-                                        for f, idx in train.items()}}
-        man['val'] = {'folds_index': {str(f): _part_manifest(target_flag, 'train', idx)
-                                      for f, idx in val.items()}}
-    elif scheme == 'legacy':
-        train = draw_train(target_flag)
-        man = dict(common, draw={
-            'scheme': 'legacy',
-            'train_per_class': TRAIN_PER_CLASS, 'val_per_class': VAL_PER_CLASS,
-            'folds': FOLDS, 'seed': SEED, 'stratified': False,
-            'procedure': 'src/data_split.py replay (legacy RandomState)',
-        })
-        man['train'] = {'per_class': TRAIN_PER_CLASS, 'folds': FOLDS, 'seed': SEED,
-                        'stratified': False,
-                        'procedure': 'src/data_split.py replay (legacy RandomState)',
-                        'folds_index': {str(f): _part_manifest(target_flag, 'train', idx)
-                                        for f, idx in train.items()}}
-        man['val'] = dict(_part_manifest(target_flag, 'val', draw_val(target_flag)),
-                          per_class=VAL_PER_CLASS, seed=SEED, stratified=True)
-    else:
-        raise ValueError(f'unknown scheme {scheme!r} (capped or legacy)')
+    train, val = draw_official(target_flag)
+    man = dict(common, draw={
+        'train_per_class': TRAIN_PER_CLASS,
+        'val_per_class': VAL_PER_CLASS,
+        'val_sparse': VAL_SPARSE,
+        'val_sparse_share': VAL_SPARSE_SHARE,
+        'val_allocation': "in proportion to the class mix of the fold's own training "
+                          'draw, by largest remainder, and never more of a class than '
+                          'the official validation split holds of it; a class left with '
+                          'fewer than %d images takes %g of its training count instead, '
+                          'paid for out of the largest classes'
+                          % (VAL_SPARSE, VAL_SPARSE_SHARE),
+        'val_conditional_on_train': True,
+        'folds': FOLDS, 'seed': SEED, 'stratified': False,
+        'source_split': {'train': 'train', 'val': 'val'},
+        'procedure': 'src/make_splits.py draw_official (PCG64, spawned per fold)',
+    })
+    man['train'] = {'folds_index': {str(f): _part_manifest(target_flag, 'train', idx)
+                                    for f, idx in train.items()}}
+    man['val'] = {'folds_index': {str(f): _part_manifest(target_flag, 'val', idx)
+                                  for f, idx in val.items()}}
 
     man['created'] = datetime.now().isoformat(timespec='seconds')
     write_manifest(man, manifest_path(target_flag, split_dir))
@@ -412,16 +398,8 @@ def _part(man, part):
 
 
 def _source_split(man, part):
-    """Which official split a part's indices point into.
-
-    Recorded per part since the capped draw takes validation out of the training pool
-    too; manifests written before the field existed had validation, and only
-    validation, coming from the official validation split.
-    """
-    entry = entry_of(man, part)
-    if 'split' in entry:
-        return entry['split']
-    return 'val' if part == 'val' else 'train'
+    """Which official split a part's indices point into, as the manifest records it."""
+    return entry_of(man, part)['split']
 
 
 def cut(target_flag, man, verbose=True):
@@ -496,20 +474,12 @@ def write_bundle(target_flag, man, parts, dest=None, verbose=True):
     return path, digest.hexdigest(), os.path.getsize(path)
 
 
-def build(target_flag, split_dir=None, dest=None, rebuild=False, verbose=True,
-          scheme=SCHEME):
+def build(target_flag, split_dir=None, dest=None, rebuild=False, verbose=True):
     """Manifest and bundle for one target."""
     path = manifest_path(target_flag, split_dir)
-    if rebuild or not os.path.exists(path):
-        man = build_manifest(target_flag, split_dir, scheme)
-    else:
-        man = read_manifest(target_flag, split_dir)
-        if scheme_of(man) != scheme:
-            raise SystemExit(
-                f'{path} describes a {scheme_of(man)!r} draw but --scheme is '
-                f'{scheme!r}. Redrawing would invalidate every result produced against '
-                f'it, so it is not done implicitly: pass --rebuild to redraw, or '
-                f'--scheme {scheme_of(man)} to keep this one.')
+    man = (build_manifest(target_flag, split_dir)
+           if rebuild or not os.path.exists(path)
+           else read_manifest(target_flag, split_dir))
     parts = cut(target_flag, man, verbose)
     write_manifest(man, manifest_path(target_flag, split_dir))   # checksums now filled
     return man, write_bundle(target_flag, man, parts, dest, verbose)
@@ -537,11 +507,6 @@ def main(argv=None):
                                                f'{bundle_dir()})')
     p.add_argument('--rebuild', action='store_true',
                    help='redraw the manifest and rewrite the bundle')
-    p.add_argument('--scheme', choices=['capped', 'legacy'], default=SCHEME,
-                   help="'capped' (default) draws n_classes*%d images per fold at "
-                        'natural prevalence and splits each draw into train and '
-                        'validation; \'legacy\' reproduces the older two-pool draw'
-                        % TOTAL_PER_CLASS)
     p.add_argument('--verify', action='store_true', help='report only, write nothing')
     args = p.parse_args(argv)
 
@@ -555,18 +520,14 @@ def main(argv=None):
         if args.verify:
             state = 'ok' if os.path.exists(path) else 'MISSING'
             size = f'{os.path.getsize(path) / 1e9:6.2f} GB' if state == 'ok' else ' ' * 9
-            mpath = manifest_path(t, args.split_dir)
-            drawn = scheme_of(read_manifest(t, args.split_dir)) if os.path.exists(mpath) \
-                else '?'
-            print(f'{t:16s} {state:8s} {size}  {drawn:7s} {path}')
+            print(f'{t:16s} {state:8s} {size}  {path}')
             status |= state != 'ok'
             continue
         if os.path.exists(path) and not args.rebuild:
             print(f'{t:16s} exists   {os.path.getsize(path) / 1e9:6.2f} GB  {path}')
             continue
         print(f'{t}:', flush=True)
-        _, (path, digest, size) = build(t, args.split_dir, args.dest, args.rebuild,
-                                        scheme=args.scheme)
+        _, (path, digest, size) = build(t, args.split_dir, args.dest, args.rebuild)
         sums[os.path.basename(path)] = digest
         print(f'{t:16s} built    {size / 1e9:6.2f} GB  sha256 {digest[:12]}')
 
