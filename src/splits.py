@@ -38,11 +38,11 @@ TARGETS = ['bloodmnist', 'breastmnist', 'dermamnist', 'octmnist', 'organamnist',
            'organcmnist', 'organsmnist', 'pathmnist', 'pneumoniamnist', 'retinamnist',
            'tissuemnist']
 
-#: training images per class, drawn uniformly from the official training split, so the
-#: training set carries the target's own class imbalance exactly as drawn.
+#: training budget per class: `n_classes*100` images drawn from the official training
+#: split, stratified to that split's own class distribution.
 TRAIN_PER_CLASS = 100
-#: validation images per class of budget: `n_classes*25` drawn from the official
-#: validation split, allocated in proportion to the training draw's own class mix.
+#: validation budget per class: `n_classes*25` images drawn from the official validation
+#: split, stratified to that split's own class distribution.
 VAL_PER_CLASS = 25
 #: a class the proportional allocation leaves with fewer than this many validation
 #: images takes VAL_SPARSE_SHARE of its training count instead: under three positives a

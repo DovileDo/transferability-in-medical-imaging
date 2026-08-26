@@ -80,16 +80,14 @@ Three protocol choices are worth knowing about:
   very different things across the search space. Each trial is validated a fixed number of
   times over its own budget (`--validations-per-trial`).
 - **Training and validation come from the official split each belongs to.** Training is
-  `n_classes*100` images drawn uniformly from the official training split, with nothing
-  removed from it afterwards, so it carries the target's class imbalance exactly as drawn.
-  Validation is `n_classes*25` images from the official validation split, drawn
-  *conditional on the training draw*: its places are handed out in proportion to that
-  draw's class mix, so a class that is rare in training is rare in validation too. That
-  is what keeps validation measuring what the test split measures. A class the proportion
-  leaves with fewer than 3 images takes half of its training count instead — self-limiting,
-  so no class is ever handed more validation images than training ones. Both parts are
-  redrawn per fold, so validation sampling error averages down over the folds instead of
-  sitting on all of them as the same offset.
+  `n_classes*100` images from the official training split and validation is `n_classes*25`
+  from the official validation split, each stratified to the class distribution of the
+  split it comes from. Both therefore carry the target's natural imbalance exactly rather
+  than approximately, and nothing is removed from the training draw to build validation.
+  A class the validation budget leaves with fewer than 3 images takes half of its training
+  count instead — self-limiting, so no class is ever handed more validation images than
+  training ones. Both parts are redrawn per fold, so validation sampling error averages
+  down over the folds instead of sitting on all of them as the same offset.
 
 The ranges are wide on purpose. Selection has to resolve differences of well under a
 percentage point of AUC between architectures, so the space has to contain the optimum
@@ -109,40 +107,37 @@ holding the images themselves. `src/hpo_finetune.py` never draws anything, never
 MedMNIST for its training or validation data, and refuses to start if the bundle it needs
 is not there.
 
-Each of the 5 folds draws **both parts from the official split each belongs to**:
-`n_classes*100` training images taken uniformly at random from the official training
-split, and `n_classes*25` validation images from the official validation split.
+Each of the 5 folds draws **both parts from the official split each belongs to**, and each
+is stratified to the class distribution of that split.
 
 | | drawn |
 |---|---|
-| `train` | `n_classes*100`, uniform from the official train split, unstratified — nothing is removed from it for validation |
-| `val` | `n_classes*25` from the official val split, allocated in proportion to the train draw's class mix, with any class left under 3 images taking half its training count; a different fold is a different validation set |
+| `train` | `n_classes*100` from the official train split, stratified to its class mix — nothing is removed from it for validation |
+| `val` | `n_classes*25` from the official val split, stratified to *its* class mix, with any class left under 3 images taking half its training count; a different fold is a different validation set |
 
-The training part is deliberately *not* stratified: the natural class imbalance is part of
-the task being studied, and because validation comes from the other pool the training set
-keeps that imbalance untouched. The validation allocation follows the training draw so that it
-estimates the same quantity the test split does — a macro one-vs-rest AUC is invariant to
-each positive class's prevalence but not to the mixture of negatives that class is ranked
-against. It is drawn conditional on the training draw for exactly that reason: what a
-class is owed in validation is set by how much of it was drawn to train on, not by how
-much of it the official validation split happens to hold.
+Both parts keep the target's natural class imbalance, which is part of the task being
+studied — stratifying is what makes them keep it *exactly* rather than in expectation. A
+uniform draw of the same size gives the right distribution on average and wobbles around
+it fold to fold: on `dermamnist` a uniform draw of 700 puts the rarest class anywhere from
+5 to 14 images, and a uniform draw of 175 validation images misses that class entirely
+about one fold in ten. Fixing the class counts removes that as a source of difference
+between folds, so what varies from fold to fold is *which* images were drawn, not how many
+of each class.
 
-There is no flat floor. A class the proportion leaves with fewer than 3 validation images
-instead takes **half of its training count**, and the largest classes pay for it. Below 3
-positives a one-vs-rest AUC is not an estimate of anything, and that class still enters
-the macro average with the same weight as every other; a standard error near 0.21 at 1
-positive and 0.15 at 2 falls to 0.12 at 3. Taking half of the training count rather than a
-fixed number is what makes the rule self-limiting — a class holding 7 training images gets
-3, one holding 5 gets 2, and no class is ever handed more validation images than it has
-training ones, which is exactly what a flat floor of 10 did to a class holding 7.
+A class the validation budget leaves with fewer than 3 images instead takes **half of its
+training count**, and the largest classes pay for it. Below 3 positives a one-vs-rest AUC
+is not an estimate of anything, and that class still enters the macro average with the
+same weight as every other; a standard error near 0.21 at 1 positive and 0.15 at 2 falls
+to 0.12 at 3. Taking half of the training count rather than a fixed number is what makes
+the rule self-limiting — no class is ever handed more validation images than it has
+training ones. This is the only place the two draws meet, and the reason validation is
+drawn after training rather than independently of it.
 
 The rule fires on `dermamnist` and nowhere else: every other target's smallest validation
-class already sits at 5 or more. On `dermamnist` it costs about 1.5pp of agreement between
-the training and validation class mixes and buys 7–17% off the fold's macro-AUC standard
-error. Where the official validation split is smaller than the budget it is used whole —
-`retinamnist` has 120 validation images against a budget of 125. A class the training draw
-misses entirely gets no validation images, and a class whose AUC is undefined is dropped
-from the macro average by `auc_per_class` rather than propagated.
+class already sits at 5 or more. Where the official validation split is smaller than the
+budget it is used whole — `retinamnist` has 120 validation images against a budget of 125.
+A class whose one-vs-rest AUC is undefined is dropped from the macro average by
+`auc_per_class` rather than propagated.
 
 Folds are drawn from independently spawned PCG64 streams keyed on `(seed 24, fold)`, so a
 fold's indices depend only on its own number: rebuilding one, or adding a sixth, cannot
@@ -194,8 +189,8 @@ run will need, hashes each part as it loads it against the manifest inside the b
 records them in `meta.json`:
 
 ```
-  train fold 1 (sha256 9eea4236ead6): 700 images, per-class [26, 34, 85, 7, 76, 463, 9]
-  val fold 1 (n_classes*25 budget, sha256 62125738f67f): 175 images, per-class [7, 8, 21, 3, 19, 113, 4]
+  train fold 1 (sha256 060df8af288d): 700 images, per-class [22, 36, 77, 8, 78, 469, 10]
+  val fold 1 (n_classes*25 budget, sha256 99900ccf10dc): 175 images, per-class [6, 9, 19, 4, 19, 115, 3]
 ```
 
 It refuses to resume a study whose trials were trained or selected on different images.

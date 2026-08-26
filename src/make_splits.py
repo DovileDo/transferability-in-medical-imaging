@@ -11,22 +11,27 @@ It needs the official MedMNIST files; `src/hpo_finetune.py` afterwards does not.
 
 What gets drawn:
 
-  Per fold, `n_classes*100` training images taken uniformly at random from the official
-  training split -- not stratified, because the natural class imbalance is part of the
-  task being studied -- and `n_classes*25` validation images taken from the official
-  validation split. Nothing is removed from the training draw to build validation; the
-  two come from the two pools MedMNIST already separates.
+  Per fold, `n_classes*100` training images from the official training split and
+  `n_classes*25` validation images from the official validation split. Each is a
+  stratified subsample of the split it comes from: the per-class budget follows that
+  split's own class distribution, so both parts carry the target's natural imbalance
+  exactly rather than approximately, and neither is reweighted by the other. Nothing is
+  removed from the training draw to build validation; the two come from the two pools
+  MedMNIST already separates.
 
-  Validation is allocated across classes in proportion to the class mix of the fold's
-  own training draw, so it measures the quantity the test split does rather than a
-  reweighted one, and a class that is rare in training is rare in validation too. It is
-  drawn conditional on the training draw for that reason.
+  Stratifying is what a uniform draw of the same size gives only in expectation. On
+  DermaMNIST a uniform draw of 700 puts the rarest class anywhere from 5 to 14 images and
+  a uniform draw of 175 validation images misses it outright about one fold in ten;
+  taking the class mix as fixed removes that as a source of difference between folds, so
+  what varies from fold to fold is which images were drawn, not how many of each class.
 
-  A class the proportion leaves with fewer than 3 validation images takes half of its
-  training count instead, and the largest classes pay for it. Half is what makes that
-  self-limiting: a class holding 7 training images gets 3, one holding 5 gets 2, and no
-  class is ever handed more validation images than it has training ones -- which is what
-  a flat floor of 10 did, and why there is not one.
+  A class the validation budget leaves with fewer than 3 images takes half of what it
+  holds in training instead, and the largest classes pay for it. Below three positives a
+  one-vs-rest AUC is not an estimate of anything, and that class still enters the macro
+  average with the same weight as every other. Half of the training count keeps the lift
+  self-limiting: no class is ever handed more validation images than it has training
+  ones. It is the only place the two draws meet, and the reason validation is drawn after
+  training rather than independently of it.
 
   Both parts are redrawn per fold, so their sampling error averages down over the folds
   of the final stage instead of sitting on every fold as one common offset.
@@ -228,12 +233,35 @@ def _labels(target_flag, split):
 # drawing
 # --------------------------------------------------------------------------------------
 
-def _allocate_val(train_counts, available, total):
-    """How many validation images each class gets, given the training draw.
+def _allocate(pool_counts, total):
+    """`total` places in proportion to `pool_counts`, by largest remainder.
 
-    `total` places handed out in proportion to the class mix of the training draw, by
-    largest remainder, and never more of a class than the official validation split
-    holds of it.
+    The result is a stratified subsample of whatever split `pool_counts` describes: it
+    carries that split's own class distribution exactly, up to the rounding the integer
+    budget forces, rather than approximately as a uniform draw of the same size would.
+    """
+    pool = np.asarray(pool_counts, dtype=np.int64)
+    total = int(min(total, int(pool.sum())))
+    exact = total * pool / max(int(pool.sum()), 1)
+    n = np.minimum(np.floor(exact).astype(np.int64), pool)
+
+    # hand out what rounding down left, by largest remainder among classes with room
+    frac = exact - np.floor(exact)
+    while int(n.sum()) < total:
+        room = np.where(n < pool, frac, -np.inf)
+        if not np.isfinite(room).any():               # every class is at its pool size
+            break
+        c = int(np.argmax(room))
+        n[c] += 1
+        frac[c] -= 1.0                                # the next place goes elsewhere
+    return n
+
+
+def _allocate_val(train_counts, available, total):
+    """How many validation images each class gets.
+
+    `total` places in proportion to the class mix of the official validation split
+    itself, so validation is a stratified subsample of that split.
 
     On top of that, a class the proportion leaves with fewer than `VAL_SPARSE` images
     takes `VAL_SPARSE_SHARE` of its training count instead, and the largest classes pay
@@ -250,20 +278,8 @@ def _allocate_val(train_counts, available, total):
     """
     train_counts = np.asarray(train_counts, dtype=np.int64)
     available = np.asarray(available, dtype=np.int64)
-
-    total = int(min(total, available.sum()))
-    exact = total * train_counts / max(int(train_counts.sum()), 1)
-    n = np.minimum(np.floor(exact).astype(np.int64), available)
-
-    # hand out what rounding down left, by largest remainder among classes with room
-    frac = exact - np.floor(exact)
-    while int(n.sum()) < total:
-        room = np.where(n < available, frac, -np.inf)
-        if not np.isfinite(room).any():               # every class is at its pool size
-            break
-        c = int(np.argmax(room))
-        n[c] += 1
-        frac[c] -= 1.0                                # the next place goes elsewhere
+    n = _allocate(available, total)
+    total = int(n.sum())
 
     # lift the classes too sparse to estimate an AUC on, never above half their own
     # training count, and take the places back from whichever class is largest
@@ -277,18 +293,17 @@ def _allocate_val(train_counts, available, total):
 def draw_official(target_flag):
     """Training from the official training split, validation from the official one.
 
-    Training is `n_classes*TRAIN_PER_CLASS` images drawn uniformly, so it carries the
-    target's class imbalance exactly as the official split has it -- nothing is removed
-    from it to build a validation set, which is the point of taking validation from the
-    other pool.
+    Each part is a stratified subsample of the official split it comes from:
+    `n_classes*TRAIN_PER_CLASS` images following the class distribution of the official
+    training split, and `n_classes*VAL_PER_CLASS` following that of the official
+    validation split. Both therefore carry the target's own class imbalance exactly, up
+    to the rounding an integer budget forces, and neither is reweighted by the other.
 
-    Validation is then drawn *conditional on that training draw*: `n_classes*VAL_PER_CLASS`
-    images from the official validation split, allocated across classes in proportion to
-    the training draw's own class mix, with `_allocate_val` lifting any class the
-    proportion leaves too sparse to estimate an AUC on. That proportion is why the two
-    are not drawn independently -- what a class is owed in validation is set by how much
-    of it was drawn to train on, not by how much of it the official validation split
-    happens to hold.
+    Nothing is taken out of the training draw to build validation -- that is the point of
+    taking validation from the other pool. The one place the two parts meet is
+    `_allocate_val`'s lift of a class too sparse to estimate an AUC on, which is capped at
+    half of what that class holds in training; validation is drawn after training for
+    that reason alone.
 
     Both are redrawn per fold, so their sampling error averages down over the folds of
     the final stage instead of resting on all of them as one common offset. Where the
@@ -307,28 +322,47 @@ def draw_official(target_flag):
     train, val = {}, {}
     for fold in range(1, FOLDS + 1):
         rng = np.random.default_rng([SEED, fold])
-        idx = np.sort(rng.choice(n_train, k_train, replace=False)).astype(np.int64)
+        idx = _draw_train_official(y_train, n_classes, k_train, info['task'], rng)
         train[fold] = idx
         val[fold] = _draw_val_official(labels_val, y_train[idx], n_classes, k_val,
                                        info['task'], rng)
     return train, val
 
 
-def _draw_val_official(labels, train_labels, n_classes, total, task, rng):
-    """`total` images from the official validation split, given the training draw."""
+def _stratified(labels, take, rng):
+    """The indices `take` names, drawn without replacement inside each class."""
+    y = np.asarray(labels).reshape(-1)
+    idx = np.concatenate([rng.choice(np.flatnonzero(y == c), t, replace=False)
+                          for c, t in enumerate(take) if t > 0])
+    return np.sort(idx).astype(np.int64)
+
+
+def _uniform(labels, total, rng):
+    """A plain draw, for multi-label targets that have no single class per image."""
+    return np.sort(rng.choice(len(labels), min(total, len(labels)),
+                              replace=False)).astype(np.int64)
+
+
+def _draw_train_official(labels, n_classes, total, task, rng):
+    """`total` images from the official training split, following its class mix."""
     if task == 'multi-label, binary-class':
-        # no single class per image to allocate on; keep the budget, draw uniformly
-        return np.sort(rng.choice(len(labels), min(total, len(labels)),
-                                  replace=False)).astype(np.int64)
+        return _uniform(labels, total, rng)
+
+    y = np.asarray(labels).reshape(-1)
+    return _stratified(y, _allocate([int((y == c).sum()) for c in range(n_classes)],
+                                    total), rng)
+
+
+def _draw_val_official(labels, train_labels, n_classes, total, task, rng):
+    """`total` images from the official validation split, following its class mix."""
+    if task == 'multi-label, binary-class':
+        return _uniform(labels, total, rng)
 
     y = np.asarray(labels).reshape(-1)
     yt = np.asarray(train_labels).reshape(-1)
-    members = [np.flatnonzero(y == c) for c in range(n_classes)]
     take = _allocate_val([int((yt == c).sum()) for c in range(n_classes)],
-                         [len(m) for m in members], total)
-    idx = np.concatenate([rng.choice(m, t, replace=False)
-                          for m, t in zip(members, take) if t > 0])
-    return np.sort(idx).astype(np.int64)
+                         [int((y == c).sum()) for c in range(n_classes)], total)
+    return _stratified(y, take, rng)
 
 
 def _part_manifest(target_flag, split, index):
@@ -361,14 +395,15 @@ def build_manifest(target_flag, split_dir=None):
         'val_per_class': VAL_PER_CLASS,
         'val_sparse': VAL_SPARSE,
         'val_sparse_share': VAL_SPARSE_SHARE,
-        'val_allocation': "in proportion to the class mix of the fold's own training "
-                          'draw, by largest remainder, and never more of a class than '
-                          'the official validation split holds of it; a class left with '
+        'train_allocation': 'stratified: in proportion to the class mix of the official '
+                            'training split, by largest remainder',
+        'val_allocation': 'stratified: in proportion to the class mix of the official '
+                          'validation split, by largest remainder; a class left with '
                           'fewer than %d images takes %g of its training count instead, '
                           'paid for out of the largest classes'
                           % (VAL_SPARSE, VAL_SPARSE_SHARE),
         'val_conditional_on_train': True,
-        'folds': FOLDS, 'seed': SEED, 'stratified': False,
+        'folds': FOLDS, 'seed': SEED, 'stratified': True,
         'source_split': {'train': 'train', 'val': 'val'},
         'procedure': 'src/make_splits.py draw_official (PCG64, spawned per fold)',
     })
