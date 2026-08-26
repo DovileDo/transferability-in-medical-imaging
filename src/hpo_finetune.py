@@ -203,8 +203,10 @@ def eval_transform():
 def load_train(target_flag, fold=1, bundle_dir=None):
     """Training part of one fold, from the bundle.
 
-    Not stratified -- the natural class imbalance is part of the task. It is one half of
-    that fold's draw; `load_val` holds the other, and the two are disjoint.
+    `n_classes*100` images from the official training split, stratified to that split's
+    own class distribution, so the target's natural imbalance -- which is part of the task
+    being studied -- is carried exactly rather than in expectation. `load_val` holds the
+    other part, drawn from the official *validation* split.
     """
     imgs, labels, entry = splits.load_train(target_flag, fold, bundle_dir)
     as_rgb = INFO[target_flag]['n_channels'] == 1
@@ -215,8 +217,8 @@ def load_train(target_flag, fold=1, bundle_dir=None):
 def load_val(target_flag, fold=1, bundle_dir=None):
     """Validation part of one fold, checksum-verified on load.
 
-    Drawn from the same collection as that fold's training part, so selection is made on
-    data a practitioner holding this dataset would actually have been able to set aside.
+    `n_classes*25` images from the official validation split, stratified to that split's
+    own class distribution, so selection is scored on the prevalence the test split has.
     Because it varies per fold, its sampling error averages down over the final stage
     rather than sitting on every fold as the same offset.
     """
@@ -1693,9 +1695,8 @@ def main(argv=None):
     print(f'  val fold {cfg.fold} (n_classes*{splits.VAL_PER_CLASS} budget, sha256 '
           f'{val_entry["images_sha256"][:12]}): '
           f'{describe_labels(valset, cfg.target)}')
-    print(f'  validation is drawn per fold from the official validation split, in '
-          f"proportion to that fold's own training class mix; folds {folds_used} each "
-          f'have their own')
+    print(f'  train and val are each stratified to the class mix of the official split '
+          f'they are drawn from; folds {folds_used} each have their own of both')
     print(f'device {device}, fp32, {len(cfg.archs)} architectures, '
           f'{cfg.trials} trials + {final_runs} final runs each (search on fold '
           f'{cfg.fold}; top {cfg.final_topk} configurations rerun on folds '
