@@ -113,6 +113,17 @@ MEDMNIST_ROOT = os.environ.get('MEDMNIST_ROOT', os.path.expanduser('~/.medmnist'
 # published results. googlenet stays: its natural successor, inception_v3, cannot take
 # 224px input, and feeding one architecture different images would break the property
 # that every architecture sees the same ones.
+#: The architectures being ranked. Short keys, because they name a family rather than a
+#: particular checkpoint, and every file that scores these networks reads this table --
+#: src/hpo_metric_folds.py imports it -- so the variant is defined once.
+#:
+#: The second group was added after the first nine had run. Nine architectures leave the
+#: permutation null for weighted tau at an SD of 0.31, where only |tau| > 0.59 clears 5%
+#: and almost nothing did; fifteen brings that to 0.47, and the power to detect a true
+#: tau of 0.4 from 25% to 43%. The six were chosen to add axes the first nine lack rather
+#: than more sizes of what is there: attention in three forms (pure, hierarchical,
+#: hybrid), grouped convolution, a designed search space, and multi-branch at a modern
+#: scale -- googlenet being Inception v1.
 ARCHS = {
     'densenet': 'densenet121',
     'efficientnet': 'efficientnet_b0',
@@ -123,6 +134,12 @@ ARCHS = {
     'convnext': 'convnext_tiny',
     'shufflenet': 'shufflenet_v2_x1_0',
     'resnet': 'resnet50',
+    'vit': 'vit_b_16',
+    'swin': 'swin_t',
+    'maxvit': 'maxvit_t',
+    'resnext': 'resnext50_32x4d',
+    'regnet': 'regnet_y_800mf',
+    'inception': 'inception_v3',
 }
 
 
@@ -466,6 +483,14 @@ def build_model(arch, n_classes, dropout=0.0):
         raise ValueError(f'unknown architecture {arch!r} (torchvision has no {name})')
     net = ctor(weights='IMAGENET1K_V1')
 
+    # inception_v3's auxiliary classifier is built for 299x299. At 224 its branch reaches
+    # 3x3 before a 5x5 convolution and the forward pass raises -- but only in training
+    # mode, since eval() skips the aux head, so it passes a smoke test and dies in the
+    # first trial. The weights have to be loaded with it present, then it is removed.
+    if name == 'inception_v3':
+        net.aux_logits = False
+        net.AuxLogits = None
+
     def make_head(in_features):
         linear = nn.Linear(in_features, n_classes)
         return nn.Sequential(nn.Dropout(p=dropout), linear) if dropout > 0 else linear
@@ -482,10 +507,13 @@ def build_model(arch, n_classes, dropout=0.0):
             i = _last_linear(clf)
             clf[i] = make_head(clf[i].in_features)
             head = clf[i]
-    elif hasattr(net, 'heads'):                                        # vision transformers
+    elif hasattr(net, 'heads'):                                        # vit
         i = _last_linear(net.heads)
         net.heads[i] = make_head(net.heads[i].in_features)
         head = net.heads[i]
+    elif hasattr(net, 'head') and isinstance(net.head, nn.Linear):     # swin
+        net.head = make_head(net.head.in_features)
+        head = net.head
     else:
         raise ValueError(f'do not know how to replace the head of {name}')
     return net, head
@@ -1257,14 +1285,25 @@ def candidate_trials(study, k, cfg=None):
 
 
 def run_final(arch, study, cfg, ctx, out_dir, progress):
-    """Retrain the shortlist on the held-out folds -- this is the ground truth.
+    """Retrain the shortlist and pick a winner -- this is the ground truth.
 
     The search ranks configurations on one run each, scored on 25 images per class; the
     top of that ranking is decided by a margin far smaller than the noise in it. So the
     shortlist, not the argmax, is what leaves the search: the top `--final-topk`
-    configurations are each retrained on every fold in `--final-folds`, none of which
-    they were tuned on, and the one with the highest validation AUC *averaged over those
-    folds* wins. Its mean test AUC over the same runs is the number we report.
+    configurations are each retrained on every fold in `--final-folds` with
+    `--final-seeds` seeds, and the one with the highest validation AUC averaged over
+    those runs wins. Its mean test AUC over the same runs is the number we report.
+
+    What the re-measurement removes depends on which folds are asked for. Seed noise it
+    always removes, by the square root of the number of runs. Validation-split luck it
+    removes only when the final folds differ from `--fold`: a configuration that happens
+    to suit one split's 25 images per class keeps that advantage through any number of
+    seeds on the same split. Running the finals on the search fold is therefore a
+    deliberate choice of estimand -- the ranking on one fixed train/validation split,
+    which is the situation a practitioner with one small dataset is actually in -- and
+    not an oversight. It leaves the reported test AUC biased low by the usual
+    regression, equally across architectures unless their candidate pools differ in
+    spread.
 
     Every candidate sees the same folds with the same seeds, so the comparison between
     them is paired, and so is the comparison between architectures.
