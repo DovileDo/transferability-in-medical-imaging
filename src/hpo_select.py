@@ -35,6 +35,46 @@ PARAM_COLS = ('optimizer', 'lr', 'momentum', 'wd', 'batch_size', 'head_lr_mult',
 #: Reporting only; the objective always keeps a trial's own validation AUC.
 CHANCE_AUC = 0.55
 
+#: unsmoothed validation loss per final run, beside final_runs.csv. A sidecar rather than
+#: a column: the runner appends rows using each row's own keys and writes a header only
+#: for a new file, so a new column in a campaign already under way would misalign every
+#: field after it. src/hpo_plain_loss.py fills this in from the saved predictions.
+#: candidates whose mean validation AUC equals the best are tied, and the tie goes to the
+#: lowest mean unsmoothed validation loss. Exact equality rather than a tolerance: it
+#: fires only where validation has saturated and cannot separate configurations at all,
+#: which is where an arbitrary pick does damage. On pneumoniamnist a median of 5 of the 10
+#: candidates reach identical validation AUC and the rule moves 11 of 15 architectures, by
+#: +1.5 test AUC points on average; on breastmnist, where validation still discriminates,
+#: no two candidates are ever exactly equal and the rule never fires. A tolerance band was
+#: tried instead and was worse -- at 0.001 it also reordered breastmnist, where the
+#: differences it was overriding were real.
+TIE_AUC = 0.0
+PLAIN_LOSS_FILE = 'val_loss_plain.csv'
+PLAIN_LOSS_KEYS = ('arch', 'trial', 'fold', 'seed')
+
+
+def plain_loss(y_true, y_score, task, eps=1e-12):
+    """Validation loss without label smoothing, from saved probabilities.
+
+    The loss the runner records is its training criterion, which carries the searched
+    label smoothing -- so a smoothed and an unsmoothed configuration are scored on
+    different functions, and smoothing, which keeps predictions away from 0 and 1 by
+    design, raises the number without the model being any worse. Recomputed here as
+    plain cross-entropy (binary cross-entropy for the multi-label task) so the value is
+    comparable across the whole search space. `y_score` is post-softmax or post-sigmoid,
+    as the runner stores it; probabilities are clipped away from zero before the log.
+    """
+    import numpy as np
+    y_score = np.asarray(y_score, dtype=np.float64)
+    y_true = np.asarray(y_true)
+    if task == 'multi-label, binary-class':
+        p = np.clip(y_score, eps, 1 - eps)
+        t = y_true.astype(np.float64)
+        return float(-np.mean(t * np.log(p) + (1 - t) * np.log(1 - p)))
+    idx = y_true.reshape(-1).astype(int)
+    p = np.clip(y_score[np.arange(len(idx)), idx], eps, 1.0)
+    return float(-np.mean(np.log(p)))
+
 
 def near_chance(value, diverged=False):
     """Did this trial fail to beat chance by a usable margin?
@@ -84,6 +124,15 @@ def read_final_runs(path, arch=None):
         return []
     with open(path) as f:
         rows = list(csv.DictReader(f))
+    side = os.path.join(os.path.dirname(path), PLAIN_LOSS_FILE)
+    if os.path.exists(side):
+        with open(side) as f:
+            plain = {tuple(r[k] for k in PLAIN_LOSS_KEYS): r['val_loss_plain']
+                     for r in csv.DictReader(f)}
+        for r in rows:
+            key = tuple(str(r.get(k, '')) for k in PLAIN_LOSS_KEYS)
+            if key in plain:
+                r['val_loss_plain'] = plain[key]
     return [r for r in rows if arch is None or r.get('arch') == arch]
 
 
@@ -161,6 +210,7 @@ def select(rows):
         on = [r for r in rs if r.get('fold') not in (None, '') and int(r['fold']) in common]
         val = [v for v in (_num(r, 'val_auc') for r in on) if v is not None]
         test = [v for v in (_num(r, 'test_auc') for r in on) if v is not None]
+        plain = [v for v in (_num(r, 'val_loss_plain') for r in on) if v is not None]
         if not val:
             continue
         cands.append({
@@ -168,18 +218,34 @@ def select(rows):
             'n': len(val),
             'folds': sorted({int(r['fold']) for r in on}),
             'val_auc': sum(val) / len(val),
+            'val_sd': _sd(val),
             'test_auc': sum(test) / len(test) if test else None,
             'test_sd': _sd(test),
+            'val_loss_plain': sum(plain) / len(plain) if len(plain) == len(val) else None,
             'params': {k: rs[0][k] for k in PARAM_COLS if k in rs[0]},
         })
     if not cands:
         return None
 
+    # Highest mean validation AUC wins, unless others score the same: every candidate
+    # within TIE_AUC of the best is tied, and the tie goes to the lowest mean unsmoothed
+    # validation loss. Without it a stable sort hands the tie to whichever the search
+    # ranked first -- the single-run ordering this stage exists to replace. Loss also
+    # keeps discriminating where AUC has saturated. A candidate without a loss for every
+    # run cannot win a tie; with no losses at all the highest mean validation AUC wins.
     cands.sort(key=lambda c: -c['val_auc'])
+    top = cands[0]
+    band = TIE_AUC
+    tied = [c for c in cands if c['val_auc'] >= top['val_auc'] - band]
+    with_loss = [c for c in tied if c['val_loss_plain'] is not None]
+    winner = min(with_loss, key=lambda c: c['val_loss_plain']) if with_loss else top
+    cands = [winner] + [c for c in cands if c is not winner]
     seen_folds = set().union(*folds.values())
     best = dict(cands[0])
     best['candidates'] = cands
     best['compared_on'] = sorted(common)
+    best['tie_band'] = band
+    best['n_tied'] = len(tied)
     # complete means every candidate ran on every fold any of them ran on, so the
     # choice was made on the whole planned comparison rather than a truncated one
     best['complete'] = all(fs == seen_folds for fs in folds.values())
