@@ -43,7 +43,18 @@ torchvision recipe update (Vryniotis 2021) and Wightman et al., "ResNet strikes 
   schedule the last epochs are where the learning rate is lowest, and stopping on
   validation loss mostly cuts them off.
 
-  Augmentation. Random resized crops keeping 25-100% of the area, and horizontal flips.
+  Augmentation, per dataset rather than one pipeline for all, since what is harmless
+  for one modality corrupts another. Random resized crops keeping 64-100% of the area,
+  for every dataset. Horizontal flips, except on organamnist and organcmnist, whose
+  left/right organ labels a flip swaps. Vertical flips and 90-degree rotations for
+  bloodmnist, pathmnist and dermamnist, which have no up or down. Mild colour jitter for
+  pathmnist, where stain varies between labs. Nothing else: chest X-ray, CT, OCT and
+  ultrasound have a real up-down axis, and their intensity is often the signal.
+  The floor is high on purpose: within a MedMNIST dataset the imaging scale is fixed, so
+  size is often diagnostic -- cell size in blood smears, nuclear size in pathology,
+  lesion size in ultrasound and dermoscopy -- and ImageNet's 8-100% range, a zoom of up
+  to 3.5x, would teach the network to ignore it. 64% caps the zoom at 1.25x, enough
+  variation to keep the small datasets from being memorised over 100 epochs.
   Mixup and CutMix are left out: they mix images across datasets, which has no meaning
   when each dataset has its own label space. The photometric operations of the original
   (equalise, autocontrast, sharpness) are dropped, since intensity carries diagnostic
@@ -85,6 +96,15 @@ ORDER = ['chestmnist', 'pneumoniamnist', 'pathmnist', 'dermamnist', 'octmnist',
          'retinamnist', 'breastmnist', 'bloodmnist', 'tissuemnist', 'organamnist',
          'organcmnist', 'organsmnist']
 ORGANS = ('organamnist', 'organcmnist', 'organsmnist')
+#: datasets a horizontal flip corrupts: their labels include left and right organs
+#: (femur, kidney, lung), and in axial and coronal slices a flip turns one into the other.
+#: organsmnist is sagittal, where left and right are not in the plane.
+NO_FLIP = ('organamnist', 'organcmnist')
+#: datasets with no up or down -- blood smears, tissue patches, dermoscopy -- where every
+#: rotation by 90 degrees and every reflection is an equally real image
+ROTATION_FREE = ('bloodmnist', 'pathmnist', 'dermamnist')
+#: mild stain variation for pathology, the main nuisance between labs and scanners
+COLOUR_JITTER = {'pathmnist': dict(brightness=0.1, contrast=0.1, saturation=0.15, hue=0.04)}
 #: chestmnist's own label for pneumonia, and the slot after its 14 labels for 'normal'
 CHEST_PNEUMONIA, CHEST_NORMAL = 6, 14
 MEAN, STD = 0.5, 0.5
@@ -119,6 +139,25 @@ def label_layout(target):
     return layout, n_out
 
 
+class RandomRot90:
+    """Rotate a square CHW image by a random multiple of 90 degrees."""
+
+    def __call__(self, x):
+        return torch.rot90(x, int(torch.randint(4, ())), dims=(-2, -1))
+
+
+def train_transform(d, crop_scale):
+    """The augmentation for one dataset of the pool."""
+    ops = [v2.RandomResizedCrop(224, scale=(crop_scale, 1.0), antialias=True)]
+    if d not in NO_FLIP:
+        ops.append(v2.RandomHorizontalFlip())
+    if d in ROTATION_FREE:
+        ops += [v2.RandomVerticalFlip(), RandomRot90()]
+    if d in COLOUR_JITTER:
+        ops.append(v2.ColorJitter(**COLOUR_JITTER[d]))
+    return v2.Compose(ops)
+
+
 class Pool(Dataset):
     """Every dataset of the pool, kept as its own uint8 array -- no 40 GB concatenation.
 
@@ -126,9 +165,9 @@ class Pool(Dataset):
     only expanded to three at the end, which is a third of the work.
     """
 
-    def __init__(self, arrays, transform=None):
+    def __init__(self, arrays, transforms=None):
         self.arrays = arrays                      # list of (images, labels)
-        self.transform = transform
+        self.transforms = transforms              # one per dataset, or None
         self.offsets = np.cumsum([0] + [len(a[0]) for a in arrays])
 
     def __len__(self):
@@ -140,8 +179,8 @@ class Pool(Dataset):
         j = i - self.offsets[d]
         x = torch.from_numpy(imgs[j])
         x = x.unsqueeze(0) if x.ndim == 2 else x.permute(2, 0, 1)
-        if self.transform is not None:
-            x = self.transform(x)
+        if self.transforms is not None:
+            x = self.transforms[d](x)
         if x.shape[0] == 1:
             x = x.expand(3, -1, -1)
         lab = np.zeros(LABEL_WIDTH, dtype=np.float32)
@@ -293,7 +332,8 @@ def main(argv=None):
     ap.add_argument('--smoothing', type=float, default=0.1)
     ap.add_argument('--temperature', type=float, default=0.5,
                     help='datasets are sampled in proportion to n^temperature')
-    ap.add_argument('--crop-scale', type=float, default=0.25)
+    ap.add_argument('--crop-scale', type=float, default=0.64,
+                    help='smallest crop, as a share of the image area')
     ap.add_argument('--ema-decay', type=float, default=0.9998)
     ap.add_argument('--val-every', type=int, default=5)
     ap.add_argument('--workers', type=int,
@@ -317,9 +357,7 @@ def main(argv=None):
     # forked, so the pool's arrays are shared copy-on-write rather than duplicated per
     # worker, and no child inherits a CUDA context.
     train = Pool(load_pool(args.target, args.data, 'train'),
-                 v2.Compose([v2.RandomResizedCrop(224, scale=(args.crop_scale, 1.0),
-                                                  antialias=True),
-                             v2.RandomHorizontalFlip()]))
+                 [train_transform(d, args.crop_scale) for d in datasets])
     val = Pool(load_pool(args.target, args.data, 'val'))
     sizes = np.array([len(a[0]) for a in train.arrays], dtype=np.float64)
     p = sizes ** args.temperature
