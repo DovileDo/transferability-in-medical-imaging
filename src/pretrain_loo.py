@@ -41,7 +41,8 @@ torchvision recipe update (Vryniotis 2021) and Wightman et al., "ResNet strikes 
   block initialised to zero. Trained for the full schedule, keeping an exponential moving
   average of the weights, which is what is saved. No early stopping: with a cosine
   schedule the last epochs are where the learning rate is lowest, and stopping on
-  validation loss mostly cuts them off.
+  validation loss mostly cuts them off. The average covers BatchNorm's running
+  statistics as well as the weights, as torchvision's reference does.
 
   Augmentation, per dataset rather than one pipeline for all, since what is harmless
   for one modality corrupts another. Random resized crops keeping 64-100% of the area,
@@ -258,7 +259,14 @@ class Loss(nn.Module):
 
 
 class EMA:
-    """Exponential moving average of the weights; buffers are copied, as is standard."""
+    """Exponential moving average of the weights and of BatchNorm's running statistics.
+
+    The statistics are averaged with the weights rather than copied from the live model:
+    copied, they describe the live weights, not averaged weights lagging several epochs
+    behind, and while the learning rate is high that mismatch makes the average model's
+    outputs noisy. This is torchvision's ExponentialMovingAverage with use_buffers=True.
+    Integer buffers -- BatchNorm's step counter -- are copied.
+    """
 
     def __init__(self, model, decay):
         self.model = copy.deepcopy(model).eval()
@@ -272,8 +280,15 @@ class EMA:
         m = [p.detach() for p in model.parameters()]
         torch._foreach_mul_(e, self.decay)
         torch._foreach_add_(e, m, alpha=1 - self.decay)
+        ef, mf = [], []
         for eb, mb in zip(self.model.buffers(), model.buffers()):
-            eb.copy_(mb)
+            if eb.dtype.is_floating_point:
+                ef.append(eb); mf.append(mb)
+            else:
+                eb.copy_(mb)
+        if ef:
+            torch._foreach_mul_(ef, self.decay)
+            torch._foreach_add_(ef, mf, alpha=1 - self.decay)
 
 
 def param_groups(model, wd):
