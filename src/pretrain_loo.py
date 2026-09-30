@@ -77,7 +77,11 @@ adapted to datasets from 546 images to 165k: the batch is about an eighth of the
 (a power of two between 32 and 512), so even breastmnist gets eight optimiser steps an
 epoch rather than one; and the weight average spans five epochs, as 0.9998 does for the
 leave-one-out pools, rather than a fixed number of steps longer than a small dataset's
-whole run. Leave-one-out behaviour is unchanged.
+whole run. Each run is also validated every epoch, and the weight average with the
+highest macro validation AUC is the one saved -- the same AUC the fine-tuning benchmark
+reports, and the checkpoint rule MedMNIST's own training uses -- since 546 images seen a
+hundred times will overfit before the schedule ends. Leave-one-out behaviour is
+unchanged: validated every five epochs and saved at the end.
 
 Resumable: a checkpoint is written every epoch and picked up on restart.
 
@@ -104,6 +108,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.transforms import v2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hpo_finetune                                                  # noqa: E402
 import sources                                                       # noqa: E402
 
 #: the order the original script walks the collection in; the label layout depends on it
@@ -339,6 +344,21 @@ def evaluate(model, loader, loss_fn, device, dtype, n_sets):
     return tot / n, [a if c > 0 else None for a, c in zip(acc, cnt.tolist())]
 
 
+@torch.no_grad()
+def evaluate_auc(model, loader, device, dtype, task, n_out):
+    """Macro validation AUC for a single-dataset run, as src/hpo_finetune.py computes it."""
+    model.eval()
+    scores, trues = [], []
+    multilabel = task.startswith('multi-label')
+    for x, _, y in loader:
+        with torch.autocast('cuda', dtype=dtype):
+            out = model(to_input(x, device)).float()
+        scores.append((torch.sigmoid(out) if multilabel else torch.softmax(out, 1)).cpu())
+        trues.append(y[:, :n_out] if multilabel else y[:, :1])
+    model.train()
+    return hpo_finetune.getAUC(torch.cat(trues).numpy(), torch.cat(scores).numpy(), task)
+
+
 def to_input(x, device):
     x = x.to(device, non_blocking=True).float().div_(255).sub_(MEAN).div_(STD)
     return x.contiguous(memory_format=torch.channels_last)
@@ -446,7 +466,10 @@ def main(argv=None):
         opt, lambda s: schedule(s, total, args.warmup_epochs * steps_per_epoch))
     loss_fn = Loss(layout, datasets, n_out, args.smoothing, device)
 
-    start = 0
+    if args.only:
+        args.val_every = 1
+    start, best = 0, -float('inf')
+    best_path = os.path.join(args.out, f'{name}.pt')
     if os.path.exists(ckpt_path):
         c = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(c['model'])
@@ -455,6 +478,7 @@ def main(argv=None):
         sched.load_state_dict(c['sched'])
         scaler.load_state_dict(c['scaler'])
         start = c['epoch'] + 1
+        best = c.get('best_auc', -float('inf'))
         print(f'resumed from epoch {start}', flush=True)
 
     log_path = os.path.join(args.out, f'{name}_log.csv')
@@ -489,6 +513,15 @@ def main(argv=None):
             vl, acc = evaluate(ema.model, val_loader, loss_fn, device, dtype, len(datasets))
             row['val_loss_ema'] = vl
             row.update({f'val_acc_{d}': a for d, a in zip(datasets, acc)})
+            if args.only:
+                auc = evaluate_auc(ema.model, val_loader, device, dtype,
+                                   INFO[args.only]['task'], n_out)
+                row['val_auc_ema'] = auc
+                row['best'] = int(np.isfinite(auc) and auc > best)
+                if row['best']:
+                    best = auc
+                    torch.save(ema.model.state_dict(), best_path + '.tmp')
+                    os.replace(best_path + '.tmp', best_path)
         print('  '.join(f'{k} {v:.4g}' if isinstance(v, float) else f'{k} {v}'
                         for k, v in row.items() if not k.startswith('val_acc_')), flush=True)
         new = not os.path.exists(log_path)
@@ -500,18 +533,21 @@ def main(argv=None):
         tmp = ckpt_path + '.tmp'
         torch.save({'model': model.state_dict(), 'ema': ema.model.state_dict(),
                     'opt': opt.state_dict(), 'sched': sched.state_dict(),
-                    'scaler': scaler.state_dict(), 'epoch': epoch}, tmp)
+                    'scaler': scaler.state_dict(), 'epoch': epoch, 'best_auc': best}, tmp)
         os.replace(tmp, ckpt_path)
         if last:
             break
 
-    # the EMA weights are the model; the raw ones are kept for comparison. Plain
-    # state dicts, which is what sources.load_backbone reads.
-    torch.save(ema.model.state_dict(), os.path.join(args.out, f'{name}.pt'))
-    torch.save(model.state_dict(), os.path.join(args.out, f'{name}_raw.pt'))
+    # Plain state dicts, which is what sources.load_backbone reads. For a single dataset
+    # <name>.pt is the best-validation average, already written during training; for a
+    # pool it is the final average, with the final raw weights kept beside it.
+    if not args.only:
+        torch.save(ema.model.state_dict(), best_path)
+        torch.save(model.state_dict(), os.path.join(args.out, f'{name}_raw.pt'))
     with open(os.path.join(args.out, f'{name}.json'), 'w') as f:
         json.dump({'mode': 'single' if args.only else 'leave-target-out', 'name': name,
                    'pool': datasets, 'n_classes': n_out,
+                   'best_val_auc': best if args.only else None,
                    'layout': {d: layout[d] for d in datasets}, 'args': vars(args)}, f, indent=1)
     print(f'saved {os.path.join(args.out, name)}.pt', flush=True)
 
