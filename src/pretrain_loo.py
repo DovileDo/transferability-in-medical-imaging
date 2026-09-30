@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""Leave-target-out pre-training of a ResNet-50 on the MedMNIST collection.
+"""Leave-target-out, or single-dataset, pre-training of a ResNet-50 on MedMNIST.
 
 For a target T, pre-trains from scratch on the training splits of every MedMNIST dataset
 except T, and saves a torchvision resnet50 whose classifier covers the pooled label space.
+With --only D instead, pre-trains on dataset D alone -- the single-dataset sources of the
+dataset-transfer benchmark.
 It is the ResNet-50 counterpart of src/leave-one-out-pretrain.py and produces checkpoints
 src/sources.py can load as the 'medmnist' source; that script is left untouched so the
 ResNet-18 sources stay reproducible.
@@ -66,9 +68,21 @@ torchvision recipe update (Vryniotis 2021) and Wightman et al., "ResNet strikes 
   process, and re-scored the entire training set every epoch; none of that changed what
   was learned, only how long it took.
 
+Single-dataset mode. MedMNIST's own released ResNet-50s were trained on 28x28 images
+upsampled to 224 with nearest-neighbour, and score 9 points lower on bloodmnist's native
+224 test images than on the upsampled ones they were trained on. The benchmark fine-tunes
+on native 224, so those weights would be handicapped for a reason unrelated to their data.
+--only trains the same way as the leave-one-out models, on native 224, with two settings
+adapted to datasets from 546 images to 165k: the batch is about an eighth of the dataset
+(a power of two between 32 and 512), so even breastmnist gets eight optimiser steps an
+epoch rather than one; and the weight average spans five epochs, as 0.9998 does for the
+leave-one-out pools, rather than a fixed number of steps longer than a small dataset's
+whole run. Leave-one-out behaviour is unchanged.
+
 Resumable: a checkpoint is written every epoch and picked up on restart.
 
     python src/pretrain_loo.py --target dermamnist --out models/loo_resnet50
+    python src/pretrain_loo.py --only dermamnist --out models/single_resnet50
 """
 
 import argparse
@@ -190,12 +204,10 @@ class Pool(Dataset):
         return x.contiguous(), d, torch.from_numpy(lab)
 
 
-def load_pool(target, root, split):
-    """[(images, labels)] for the pool, in ORDER, from <root>/<dataset>_224.npz."""
+def load_pool(datasets, root, split):
+    """[(images, labels)] for the given datasets, in order, from <root>/<dataset>_224.npz."""
     out = []
-    for d in ORDER:
-        if d == target:
-            continue
+    for d in datasets:
         path = os.path.join(root, f'{d}_224.npz')
         if not os.path.exists(path):
             raise SystemExit(f'{path} not found -- the pool needs every MedMNIST dataset '
@@ -335,13 +347,17 @@ def to_input(x, device):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--target', required=True, help='the MedMNIST dataset held out')
+    which = ap.add_mutually_exclusive_group(required=True)
+    which.add_argument('--target', help='the MedMNIST dataset held out of the pool')
+    which.add_argument('--only', help='train on this one MedMNIST dataset alone')
     ap.add_argument('--out', default='models/loo_resnet50')
     ap.add_argument('--data', default=os.environ.get('MEDMNIST_ROOT',
                                                      os.path.expanduser('~/.medmnist')))
     ap.add_argument('--epochs', type=int, default=100)
     ap.add_argument('--warmup-epochs', type=int, default=5)
-    ap.add_argument('--batch-size', type=int, default=512)
+    ap.add_argument('--batch-size', type=int, default=None,
+                    help='default 512 for a pool; for --only, about an eighth of the '
+                         'dataset, a power of two between 32 and 512')
     ap.add_argument('--lr', type=float, default=0.1, help='per 256 images; scaled linearly')
     ap.add_argument('--wd', type=float, default=1e-4)
     ap.add_argument('--smoothing', type=float, default=0.1)
@@ -349,7 +365,8 @@ def main(argv=None):
                     help='datasets are sampled in proportion to n^temperature')
     ap.add_argument('--crop-scale', type=float, default=0.64,
                     help='smallest crop, as a share of the image area')
-    ap.add_argument('--ema-decay', type=float, default=0.9998)
+    ap.add_argument('--ema-decay', type=float, default=None,
+                    help='default 0.9998 for a pool; for --only, whatever spans 5 epochs')
     ap.add_argument('--val-every', type=int, default=5)
     ap.add_argument('--workers', type=int,
                     default=int(os.environ.get('SLURM_CPUS_PER_TASK', 8)))
@@ -359,21 +376,35 @@ def main(argv=None):
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    layout, n_out = label_layout(args.target)
-    expected = sources.n_source_classes('medmnist', args.target)
+    if args.only:
+        name, datasets = args.only, [args.only]
+        n_out = len(INFO[args.only]['label'])
+        kind = 'multilabel' if INFO[args.only]['task'].startswith('multi-label') else 'multiclass'
+        layout = {args.only: (list(range(n_out)), kind)}
+        expected = sources.n_source_classes(args.only, None)
+    else:
+        name, datasets = args.target, [d for d in ORDER if d != args.target]
+        layout, n_out = label_layout(args.target)
+        expected = sources.n_source_classes('medmnist', args.target)
     if n_out != expected:
         raise SystemExit(f'label layout gives {n_out} classes, sources.py expects {expected}')
-    datasets = [d for d in ORDER if d != args.target]
     os.makedirs(args.out, exist_ok=True)
-    ckpt_path = os.path.join(args.out, f'{args.target}.ckpt')
-    print(f'{args.target}: pool of {len(datasets)} datasets, {n_out} classes', flush=True)
+    ckpt_path = os.path.join(args.out, f'{name}.ckpt')
+    print(f'{name}: {"single dataset" if args.only else f"pool of {len(datasets)} datasets"}, '
+          f'{n_out} classes', flush=True)
 
     # Data first, and the worker processes started before anything touches CUDA: they are
     # forked, so the pool's arrays are shared copy-on-write rather than duplicated per
     # worker, and no child inherits a CUDA context.
-    train = Pool(load_pool(args.target, args.data, 'train'),
+    train = Pool(load_pool(datasets, args.data, 'train'),
                  [train_transform(d, args.crop_scale) for d in datasets])
-    val = Pool(load_pool(args.target, args.data, 'val'))
+    val = Pool(load_pool(datasets, args.data, 'val'))
+    if args.batch_size is None:
+        if args.only:
+            b = 2 ** int(round(math.log2(max(1, len(train) / 8))))
+            args.batch_size = int(min(512, max(32, b)))
+        else:
+            args.batch_size = 512
     sizes = np.array([len(a[0]) for a in train.arrays], dtype=np.float64)
     p = sizes ** args.temperature
     p /= p.sum()
@@ -404,11 +435,13 @@ def main(argv=None):
     model = torchvision.models.resnet50(weights=None, num_classes=n_out,
                                         zero_init_residual=True)
     model = model.to(device).to(memory_format=torch.channels_last)
-    ema = EMA(model, args.ema_decay)
     lr = args.lr * args.batch_size / 256
     opt = torch.optim.SGD(param_groups(model, args.wd), lr=lr, momentum=0.9, nesterov=True)
     steps_per_epoch = len(train_loader)
     total = args.epochs * steps_per_epoch
+    if args.ema_decay is None:
+        args.ema_decay = 1 - 1 / (5 * steps_per_epoch) if args.only else 0.9998
+    ema = EMA(model, args.ema_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: schedule(s, total, args.warmup_epochs * steps_per_epoch))
     loss_fn = Loss(layout, datasets, n_out, args.smoothing, device)
@@ -424,9 +457,9 @@ def main(argv=None):
         start = c['epoch'] + 1
         print(f'resumed from epoch {start}', flush=True)
 
-    log_path = os.path.join(args.out, f'{args.target}_log.csv')
+    log_path = os.path.join(args.out, f'{name}_log.csv')
     print(f'{steps_per_epoch} steps/epoch, batch {args.batch_size}, peak lr {lr:.3f}, '
-          f'{dtype}', flush=True)
+          f'ema decay {args.ema_decay:.5f}, {dtype}', flush=True)
     step = start * steps_per_epoch
     for epoch in range(start, args.epochs):
         model.train()
@@ -474,12 +507,13 @@ def main(argv=None):
 
     # the EMA weights are the model; the raw ones are kept for comparison. Plain
     # state dicts, which is what sources.load_backbone reads.
-    torch.save(ema.model.state_dict(), os.path.join(args.out, f'{args.target}.pt'))
-    torch.save(model.state_dict(), os.path.join(args.out, f'{args.target}_raw.pt'))
-    with open(os.path.join(args.out, f'{args.target}.json'), 'w') as f:
-        json.dump({'target': args.target, 'pool': datasets, 'n_classes': n_out,
+    torch.save(ema.model.state_dict(), os.path.join(args.out, f'{name}.pt'))
+    torch.save(model.state_dict(), os.path.join(args.out, f'{name}_raw.pt'))
+    with open(os.path.join(args.out, f'{name}.json'), 'w') as f:
+        json.dump({'mode': 'single' if args.only else 'leave-target-out', 'name': name,
+                   'pool': datasets, 'n_classes': n_out,
                    'layout': {d: layout[d] for d in datasets}, 'args': vars(args)}, f, indent=1)
-    print(f'saved {os.path.join(args.out, args.target)}.pt', flush=True)
+    print(f'saved {os.path.join(args.out, name)}.pt', flush=True)
 
 
 if __name__ == '__main__':
