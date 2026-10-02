@@ -78,6 +78,7 @@ from torchvision.transforms import v2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hpo_finetune                                                  # noqa: E402
+import hpo_watch                                                     # noqa: E402
 import sources                                                       # noqa: E402
 
 #: the design above, as defaults. Each is overridable on the command line.
@@ -117,6 +118,55 @@ def _in_source_order(make):
     return build
 
 
+#: the sources this process runs, in order, for the progress table
+_JOB = []
+
+
+def _collect_job(out_root, target):
+    """hpo_watch.collect for the whole job rather than the one source running.
+
+    The runner prints its progress table from hpo_watch.collect(<out>/<source>, target),
+    which sees a single directory and so a single row. This gathers every source of the
+    job instead: finished ones with their results, the running one live, and the queued
+    ones estimated from the sources already measured -- the same network on the same
+    target, so a finished source's time is the best guess for the next.
+    """
+    root, running = os.path.split(os.path.normpath(out_root))
+    states = {s: _COLLECT(os.path.join(root, s), target) for s in _JOB}
+    now = states.get(running) or _COLLECT(out_root, target)
+
+    rows = {s: st['rows'][0] for s, st in states.items() if st['rows']}
+    measured = [r['elapsed'] + (r['remaining'] or 0) for r in rows.values() if r['measured']]
+    guess = sum(measured) / len(measured) if measured else next(
+        (r['remaining'] for r in rows.values() if r['remaining']), None)
+    meta = now['meta'] or next((st['meta'] for st in states.values() if st['meta']), {})
+    for s in _JOB:
+        rows.setdefault(s, {
+            'arch': s, 'status': hpo_watch.PENDING, 'measured': False,
+            'trials_done': 0, 'trials_total': meta.get('trials', 0), 'pruned': 0,
+            'failed': 0, 'finals_done': 0, 'finals_total': meta.get('final_runs', 0),
+            'elapsed': 0.0, 'remaining': guess, 'best_val_auc': None,
+            'final_test_auc': None, 'final_test_sd': None, 'note': 'queued'})
+
+    # a copied source (src/hpo_sources_reuse.py) carries the start of the run it came from
+    started = [st['meta']['started'] for st in states.values()
+               if st['meta'].get('started') and not st['meta'].get('reused_from')]
+    return dict(now, dir=os.path.join(root, '<source>', target),
+                meta=dict(meta, started=min(started) if started else None),
+                rows=[rows[s] for s in _JOB])
+
+
+def _render_job(state, width=96):
+    text = _RENDER(state, width)
+    return (text.replace(f"{'arch':<13}", f"{'source':<13}", 1)
+                .replace(' architectures done', ' sources done', 1)
+                .replace('(~ = from the cost probe, no finished trial yet)',
+                         '(~ = estimated: no finished trial yet)', 1))
+
+
+_COLLECT, _RENDER = hpo_watch.collect, hpo_watch.render
+
+
 def main(argv=None):
     global _TARGET, _CHANNELS
     ap = argparse.ArgumentParser(add_help=False)
@@ -144,6 +194,9 @@ def main(argv=None):
     hpo_finetune.build_model = build_model
     hpo_finetune.train_transform = _in_source_order(hpo_finetune.train_transform)
     hpo_finetune.eval_transform = _in_source_order(hpo_finetune.eval_transform)
+    # one progress table for the job, not one per source
+    _JOB[:] = chosen
+    hpo_watch.collect, hpo_watch.render = _collect_job, _render_job
 
     base = ['--target', known.target]
     for flag, value in (('--final-folds', DEFAULTS['final_folds']),
